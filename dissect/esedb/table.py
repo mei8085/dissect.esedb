@@ -9,6 +9,7 @@ from dissect.esedb.btree import BTree
 from dissect.esedb.c_esedb import (
     CODEPAGE,
     COLUMN_TYPE_MAP,
+    COMPRESSION_SCHEME,
     SYSOBJ,
     ColumnType,
     JET_coltyp,
@@ -16,7 +17,7 @@ from dissect.esedb.c_esedb import (
 )
 from dissect.esedb.exceptions import NoNeighbourPageError
 from dissect.esedb.index import Index
-from dissect.esedb.record import Record
+from dissect.esedb.record import LongValue, Record
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -24,6 +25,17 @@ if TYPE_CHECKING:
     from dissect.esedb.cursor import Cursor
     from dissect.esedb.esedb import EseDB
     from dissect.esedb.page import Page
+
+# Compression scheme identifiers that can actually be decoded. Used as a fallback to detect a
+# compressed long value chunk when missing neighbouring chunks make length-based detection unreliable.
+# Mirrors the schemes handled by :func:`dissect.esedb.compression.decompress`.
+IMPLEMENTED_COMPRESSION_SCHEMES = frozenset(
+    (
+        int(COMPRESSION_SCHEME.COMPRESS_7BITASCII),
+        int(COMPRESSION_SCHEME.COMPRESS_7BITUNICODE),
+        int(COMPRESSION_SCHEME.COMPRESS_XPRESS),
+    )
+)
 
 
 class Table:
@@ -183,20 +195,34 @@ class Table:
         for node in self.root.iter_leaf_nodes():
             yield Record(self, node)
 
-    def get_long_value(self, key: bytes) -> bytes:
+    def get_long_value(self, key: bytes) -> LongValue:
         """Retrieve a value from the long value page of the table.
+
+        Long values can be split over multiple chunks, each stored as a separate long value tree
+        node. The node key ends with the big-endian logical offset of the chunk inside the complete
+        value, while the long value header node declares the total (uncompressed) value size.
+
+        Every available chunk is decompressed and concatenated in logical order. If chunks are
+        missing, the surviving bytes are returned as a fragmented :class:`LongValue` together with
+        the missing byte ranges, rather than silently joined into something that looks like a
+        complete value. A :class:`LongValue` whose :attr:`~LongValue.is_complete` is ``True``
+        contains every byte of the declared value.
 
         Args:
             key: The lookup key for the long value.
+
+        Returns:
+            A :class:`LongValue` holding the reassembled bytes and their completeness information.
         """
         rkey = key[::-1]
         btree = BTree(self.esedb, self.lv_page)
         header = btree.search(rkey)
 
         _, size = struct.unpack("<2I", header.data)
-        chunks = []
-        chunk_offsets = []
 
+        # Collect the available chunks as (logical offset, stored chunk data) pairs. A truncated
+        # neighbour page simply ends the enumeration; the missing tail is detected further below.
+        chunks: list[tuple[int, bytes]] = []
         while True:
             try:
                 node = btree.next()
@@ -205,23 +231,51 @@ class Table:
             except NoNeighbourPageError:
                 break
 
-            chunks.append(node.data)
-
             chunk_offset = struct.unpack(">I", node.key[-4:])[0]
-            chunk_offsets.append(chunk_offset)
+            chunks.append((chunk_offset, bytes(node.data)))
 
-        chunk_offsets.append(size)
+        buf = bytearray()
+        gaps: list[tuple[int, int]] = []
+        expected_offset = 0
 
-        buf = []
-        chunk_offset = 0
-        for chunk, next_chunk_offset in zip(chunks, chunk_offsets[1:], strict=False):
-            # Chunk sizes should be used to determine if a chunk is compressed
-            if len(chunk) != next_chunk_offset - chunk_offset:
-                chunk = compression.decompress(chunk)
-            buf.append(chunk)
-            chunk_offset += next_chunk_offset
+        for index, (chunk_offset, chunk_data) in enumerate(chunks):
+            next_chunk_offset = chunks[index + 1][0] if index + 1 < len(chunks) else size
+            gap_before = chunk_offset != expected_offset
+            if gap_before:
+                gaps.append((expected_offset, chunk_offset))
 
-        return b"".join(buf)
+            if not gap_before:
+                # Healthy, contiguous layout: the logical chunk span is reliable. A chunk whose
+                # stored size differs from its logical span is compressed.
+                is_compressed = len(chunk_data) != (next_chunk_offset - chunk_offset)
+                if is_compressed:
+                    # Long values are decompressed here so the caller always works with plain bytes.
+                    chunk_data = compression.decompress(chunk_data)
+            elif chunk_data and (chunk_data[0] >> 3) in IMPLEMENTED_COMPRESSION_SCHEMES:
+                # A gap precedes this chunk: its computed span may cover missing data and cannot be
+                # used to detect compression. The first byte suggests a known compression scheme, but
+                # raw data can start with the same byte by coincidence (the 7-bit decompressor in
+                # particular accepts almost any input). Decompress best-effort and only accept the
+                # result if it fits the logical bounds of this chunk; otherwise keep the raw bytes.
+                # The value is already marked fragmented, so this never presents fabricated content.
+                max_logical_length = next_chunk_offset - chunk_offset
+                try:
+                    candidate = compression.decompress(chunk_data)
+                except Exception:
+                    candidate = None
+                if candidate is not None and 0 < len(candidate) <= max_logical_length:
+                    chunk_data = candidate
+
+            buf.extend(chunk_data)
+
+            # Track the logical position from the chunk's own offset and its actual (decompressed)
+            # length. In a healthy file this equals the declared span exactly.
+            expected_offset = chunk_offset + len(chunk_data)
+
+        if expected_offset != size:
+            gaps.append((expected_offset, size))
+
+        return LongValue(bytes(buf), size, tuple(gaps))
 
     def _add_column(self, column: Column) -> None:
         """Add a column to the table."""

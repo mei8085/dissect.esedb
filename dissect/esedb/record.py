@@ -22,6 +22,77 @@ def noop(value: Any) -> Any:
     return value
 
 
+class LongValue(bytes):
+    """A reassembled long value stored across one or more long value tree chunks.
+
+    Behaves as regular :class:`bytes` (so existing consumers keep working) but additionally records
+    whether the reassembly covered the complete value declared by the long value header. Forensic
+    tooling must not treat a fragmented value as if it were the complete evidence.
+
+    Args:
+        data: The reassembled bytes, with each available chunk decompressed and concatenated in
+            logical order. Missing byte ranges are not padded or concatenated away.
+        size: The complete value size in bytes as declared by the long value header.
+        gaps: Tuple of ``(start, end)`` logical byte ranges that were missing during reassembly.
+    """
+
+    def __new__(cls, data: bytes, size: int, gaps: tuple[tuple[int, int], ...] = ()) -> LongValue:  # noqa: PYI034
+        obj = bytes.__new__(cls, data)
+        obj._declared_size = size
+        obj._gaps = tuple(gaps)
+        return obj
+
+    @property
+    def is_complete(self) -> bool:
+        """Return whether every byte of the declared value was available and reassembled."""
+        return not self._gaps and len(self) == self._declared_size
+
+    @property
+    def declared_size(self) -> int:
+        """Return the complete value size in bytes as declared by the long value header."""
+        return self._declared_size
+
+    @property
+    def gaps(self) -> tuple[tuple[int, int], ...]:
+        """Return the missing logical byte ranges as ``(start, end)`` tuples."""
+        return self._gaps
+
+
+class LongText(str):
+    """A decoded long text value that was stored separately across long value tree chunks.
+
+    Behaves as regular :class:`str` but carries the reassembly completeness information from the
+    underlying :class:`LongValue`, so a fragmented text value can never be mistaken for the complete
+    evidence after decoding.
+
+    Args:
+        value: The decoded text.
+        long_value: The :class:`LongValue` the text was decoded from.
+    """
+
+    __slots__ = ("_long_value",)
+
+    def __new__(cls, value: str, long_value: LongValue) -> LongText:  # noqa: PYI034
+        obj = str.__new__(cls, value)
+        obj._long_value = long_value
+        return obj
+
+    @property
+    def is_complete(self) -> bool:
+        """Return whether every byte of the declared value was available and reassembled."""
+        return self._long_value.is_complete
+
+    @property
+    def declared_size(self) -> int:
+        """Return the complete value size in bytes as declared by the long value header."""
+        return self._long_value.declared_size
+
+    @property
+    def gaps(self) -> tuple[tuple[int, int], ...]:
+        """Return the missing logical byte ranges as ``(start, end)`` tuples."""
+        return self._long_value.gaps
+
+
 class Record:
     """Wrapper class for records in a table.
 
@@ -226,6 +297,15 @@ class RecordData:
         if raw:
             if isinstance(value, memoryview):
                 value = value.tobytes()
+            if (
+                tag_field
+                and value is not None
+                and tag_field.flags & TAGFLD_HEADER.Separated
+                and not tag_field.flags & TAGFLD_HEADER.MultiValues
+            ):
+                # Resolve separated long values so raw reads expose the reassembled bytes (including
+                # completeness information) rather than just the inline long value lookup key.
+                value = self.table.get_long_value(bytes(value))
             return value
 
         if value is not None:
@@ -283,20 +363,32 @@ class RecordData:
             if tag_field:
                 if tag_field.flags & TAGFLD_HEADER.MultiValues:
                     value = self._parse_multivalue(value, tag_field)
-                else:
-                    if tag_field.flags & TAGFLD_HEADER.Separated:
-                        value = self.table.get_long_value(bytes(value))
-                    elif tag_field.flags & TAGFLD_HEADER.Compressed:
-                        # Long values are already decompressed during retrieval
-                        value = compression.decompress(value)
+                elif tag_field.flags & TAGFLD_HEADER.Separated:
+                    value = self.table.get_long_value(bytes(value))
+                elif tag_field.flags & TAGFLD_HEADER.Compressed:
+                    # Long values are already decompressed during retrieval
+                    value = compression.decompress(value)
 
-            parse_func = parse_func or noop
             if tag_field and tag_field.flags & TAGFLD_HEADER.MultiValues:
-                value = list(map(parse_func, value))
+                value = [self._finalize_value(column, item, parse_func) for item in value]
             else:
-                value = parse_func(value)
+                value = self._finalize_value(column, value, parse_func)
 
         return value
+
+    def _finalize_value(self, column: Column, value: Any, parse_func: Any) -> RecordValue:
+        """Apply the column type parser while preserving long value completeness metadata.
+
+        A :class:`LongValue` parses to an equivalent :class:`LongText` for text columns (and stays a
+        :class:`LongValue` for binary columns), so a fragmented value can never surface as a plain
+        value that looks complete.
+        """
+        if isinstance(value, LongValue):
+            if column.is_text:
+                return LongText(parse_func(bytes(value)), value)
+            return value
+
+        return parse_func(value)
 
     def _parse_multivalue(self, value: bytes, tag_field: TagField) -> list[bytes]:
         fSeparatedInstance = 0x8000
@@ -327,8 +419,13 @@ class RecordData:
             raise ValueError(f"Unknown flags for tag field: {tag_field}")
 
         if tag_field.flags & TAGFLD_HEADER.Compressed:
-            # Only the first entry appears to be compressed
-            value[0] = compression.decompress(value[0])
+            # Only the first entry appears to be compressed. Preserve any long value metadata by
+            # rewrapping the decompressed bytes instead of replacing the value with plain bytes.
+            first_value = compression.decompress(bytes(value[0]))
+            if isinstance(value[0], LongValue):
+                value[0] = LongValue(first_value, value[0].declared_size, value[0].gaps)
+            else:
+                value[0] = first_value
 
         return value
 
