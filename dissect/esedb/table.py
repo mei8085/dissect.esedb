@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
     from dissect.esedb.cursor import Cursor
     from dissect.esedb.esedb import EseDB
-    from dissect.esedb.page import Page
+    from dissect.esedb.page import Page, TagSource
 
 
 class Table:
@@ -179,9 +179,42 @@ class Table:
         return self.cursor().search(**kwargs)
 
     def records(self) -> Iterator[Record]:
-        """Return an iterator of all the records of the table."""
-        for node in self.root.iter_leaf_nodes():
+        """Return an iterator of all active records of the table.
+
+        Logically deleted records still occupy physical space but are not active rows. They are available
+        through :meth:`deleted_records` as residual evidence.
+        """
+        for node in self.root.iter_active_leaf_nodes():
             yield Record(self, node)
+
+    def deleted_records(self) -> Iterator[Record]:
+        """Return an iterator of all logically deleted records of the table.
+
+        Deleted records still occupy physical space in a page and can be residual evidence, but they are
+        not part of the active row set. They are therefore excluded from :meth:`records`.
+        """
+        for page in self.root.iter_leaf_pages():
+            for source in page.deleted_tag_sources():
+                if source.node_num is None:
+                    continue
+
+                yield Record(self, page.node(source.node_num))
+
+    def records_with_source(self, include_deleted: bool = False) -> Iterator[tuple[Record, TagSource]]:
+        """Return an iterator of records together with their physical tag source.
+
+        The tag source provides the traceable position (page number, node number, offset and size) as well as
+        the logical visibility, allowing a forensic inventory to keep raw traces and active rows separate.
+
+        Args:
+            include_deleted: Whether to also yield logically deleted records as residual evidence.
+        """
+        for page in self.root.iter_leaf_pages():
+            for source in page.node_tag_sources():
+                if source.deleted and not include_deleted:
+                    continue
+
+                yield Record(self, page.node(source.node_num)), source
 
     def get_long_value(self, key: bytes) -> bytes:
         """Retrieve a value from the long value page of the table.

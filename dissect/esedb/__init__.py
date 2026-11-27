@@ -5,6 +5,7 @@ from dissect.esedb.exceptions import (
     KeyNotFoundError,
     NoNeighbourPageError,
 )
+from dissect.esedb.page import TagSource, TagStatus
 
 __all__ = [
     "CompressedTaggedDataError",
@@ -13,4 +14,6 @@ __all__ = [
     "InvalidDatabase",
     "KeyNotFoundError",
     "NoNeighbourPageError",
+    "TagSource",
+    "TagStatus",
 ]

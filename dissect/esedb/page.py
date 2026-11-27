@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import struct
+from enum import Enum
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from dissect.esedb.c_esedb import PAGE_FLAG, TAG_FLAG, c_esedb
 
@@ -10,6 +11,87 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from dissect.esedb.esedb import EseDB
+
+
+class TagStatus(Enum):
+    """The logical visibility of a physical page tag.
+
+    A tag that still occupies space in a page is not necessarily an active record. Both small pages
+    (<= 8K) and large pages (> 8K) encode the :attr:`~dissect.esedb.c_esedb.TAG_FLAG.Deleted` bit,
+    only the physical location of that bit differs. Decoding it here gives the same meaning for
+    every page specification.
+
+    ``Reserved`` tags (such as the page key tag) occupy physical space but never represent a node,
+    so they are neither active rows nor deleted records.
+    """
+
+    Active = "active"
+    Deleted = "deleted"
+    Reserved = "reserved"
+
+
+class TagSource(NamedTuple):
+    """The provenance of a physical page tag.
+
+    This combines the raw trace (where the tag and its data physically live in the database) with
+    the logical visibility (whether the tag still represents an active record). Keeping both
+    allows a forensic inventory to distinguish residual evidence from live rows.
+
+    Attributes:
+        page_num: The logical page number the tag lives in.
+        tag_num: The index of the tag within the page tag array.
+        node_num: The index of the node derived from this tag, or ``None`` for reserved tags.
+        offset: The offset of the tag data relative to the start of the page data area.
+        size: The size of the tag data in bytes.
+        status: The logical visibility of the tag.
+    """
+
+    page_num: int
+    tag_num: int
+    node_num: int | None
+    offset: int
+    size: int
+    status: TagStatus
+
+    @property
+    def deleted(self) -> bool:
+        """Return whether this tag is logically deleted."""
+        return self.status is TagStatus.Deleted
+
+    @property
+    def active(self) -> bool:
+        """Return whether this tag is logically active."""
+        return self.status is TagStatus.Active
+
+    @property
+    def reserved(self) -> bool:
+        """Return whether this tag is reserved and does not represent a node."""
+        return self.status is TagStatus.Reserved
+
+    @property
+    def node_position(self) -> tuple[int, int] | None:
+        """Return the traceable ``(page_num, node_num)`` position of this tag, if it is a node."""
+        if self.node_num is None:
+            return None
+
+        return self.page_num, self.node_num
+
+    def to_dict(self) -> dict[str, int | str | None]:
+        """Serialize this tag source to a dictionary."""
+        return {
+            "page_num": self.page_num,
+            "tag_num": self.tag_num,
+            "node_num": self.node_num,
+            "offset": self.offset,
+            "size": self.size,
+            "status": self.status.value,
+        }
+
+    def __repr__(self) -> str:
+        return (
+            f"<TagSource page={self.page_num} tag={self.tag_num} node={self.node_num} "
+            f"offset={self.offset:#x} size={self.size:#x} status={self.status.value}>"
+        )
 
 
 class Page:
@@ -114,7 +196,8 @@ class Page:
     def node(self, num: int) -> BranchNode | LeafNode:
         """Retrieve a node by index.
 
-        Nodes are just tags, but indexed from the first tag.
+        Nodes are just tags, but indexed from the first tag. Tag 0 (the page key tag) and the trailing
+        reserved tags beyond ``node_count`` are not nodes.
 
         Args:
             num: The node number to retrieve.
@@ -135,8 +218,57 @@ class Page:
         for i in range(self.node_count):
             yield self.node(i)
 
-    def iter_leaf_nodes(self) -> Iterator[LeafNode]:
-        """Walk the page tree and yield leaf nodes.
+    def tag_source(self, num: int) -> TagSource:
+        """Return the provenance of the tag with index ``num``.
+
+        This includes reserved tags (see :attr:`Tag.is_reserved`), which have no node.
+
+        Args:
+            num: The tag number to describe.
+
+        Raises:
+            IndexError: If the tag number is out of bounds.
+        """
+        tag = self.tag(num)
+        return TagSource(
+            page_num=self.num,
+            tag_num=tag.num,
+            node_num=tag.node_num,
+            offset=tag.offset,
+            size=tag.size,
+            status=tag.status,
+        )
+
+    def tag_sources(self) -> Iterator[TagSource]:
+        """Yield the provenance of all physical tags, including reserved tags.
+
+        Reserved tags are included because they also occupy physical space in the page, even though
+        they never represent a record.
+        """
+        for i in range(self.tag_count):
+            yield self.tag_source(i)
+
+    def node_tag_sources(self) -> Iterator[TagSource]:
+        """Yield the provenance of all nodes, excluding reserved tags."""
+        for i in range(self.tag_count):
+            source = self.tag_source(i)
+            if source.node_num is not None:
+                yield source
+
+    def deleted_tag_sources(self) -> Iterator[TagSource]:
+        """Yield the provenance of all logically deleted tags."""
+        for source in self.tag_sources():
+            if source.deleted:
+                yield source
+
+    def active_tag_sources(self) -> Iterator[TagSource]:
+        """Yield the provenance of all logically active node tags, excluding reserved tags."""
+        for source in self.node_tag_sources():
+            if source.active:
+                yield source
+
+    def iter_leaf_pages(self) -> Iterator[Page]:
+        """Walk the page tree and yield leaf pages in key order.
 
         Two methods can be used, one is to travel down to the first leaf, and keep reading ``next_page``'s,
         the other is to traverse the tree branches.
@@ -144,22 +276,60 @@ class Page:
         Impacket uses the first method, but gets caught in an infinite loop on some dirty databases.
         Traversing the branches seems safer, at the risk of missing a couple (possibly corrupt) pages.
 
-        For this reason, we actually explicitly check if the last page we parse has a ``next_page`` attribute,
-        and also parse that. This methods seems to work so far.
+        For this reason, we also explicitly check for a ``next_page`` after the last branch we descend, and
+        parse that chain as well. This method seems to work so far.
+
+        Unlike :meth:`nodes`, this does not skip deleted branch entries: a deleted branch entry can still
+        reference a child page with active records.
         """
-        esedb = self.esedb
-        leaf = None
+        seen = set()
+        pages = list(self._walk_leaf_pages(seen))
+
+        # Check if the last leaf we descended to has a ``next_page`` and parse that chain as well.
+        # This only applies to root branch pages, matching the historical traversal behaviour.
+        if self.is_root and not self.is_leaf and pages and pages[-1].next_page:
+            pages.extend(self.esedb.page(pages[-1].next_page)._walk_leaf_pages(seen))
+
+        yield from pages
+
+    def _walk_leaf_pages(self, seen: set[int]) -> Iterator[Page]:
+        """Recursively descend a page, yielding leaf pages exactly once."""
+        if self.num in seen:
+            return
+
+        seen.add(self.num)
+
+        if self.is_leaf:
+            yield self
+            return
 
         for node in self.nodes():
-            if self.is_leaf:
-                yield node
-            else:
-                child = esedb.page(node.child)
-                for leaf in child.iter_leaf_nodes():
-                    yield leaf
+            yield from self.esedb.page(node.child)._walk_leaf_pages(seen)
 
-        if self.is_root and leaf and leaf.tag.page.next_page:
-            yield from esedb.page(leaf.tag.page.next_page).iter_leaf_nodes()
+    def iter_leaf_nodes(self, include_deleted: bool = True) -> Iterator[LeafNode]:
+        """Walk the page tree and yield leaf nodes.
+
+        By default this yields every leaf node that still occupies physical space, including logically
+        deleted ones, since this method exposes the physical layout. Pass ``include_deleted=False`` to get
+        only active leaf nodes.
+
+        Deleted tags can also be inspected through :meth:`deleted_tag_sources`.
+
+        See :meth:`iter_leaf_pages` for the page traversal strategy.
+
+        Args:
+            include_deleted: Whether to also yield logically deleted leaf nodes.
+        """
+        for page in self.iter_leaf_pages():
+            for source in page.node_tag_sources():
+                if source.deleted and not include_deleted:
+                    continue
+
+                yield page.node(source.node_num)
+
+    def iter_active_leaf_nodes(self) -> Iterator[LeafNode]:
+        """Walk the page tree and yield only logically active leaf nodes."""
+        return self.iter_leaf_nodes(include_deleted=False)
 
     def __repr__(self) -> str:
         return f"<Page num={self.num:d}>"
@@ -194,7 +364,11 @@ class Tag:
         self.data = self.page.data[self.offset : self.offset + self.size]
 
         flags = 0
-        if page.is_small_page:
+        if self.is_reserved:
+            # Reserved tags (such as the page key tag) are not record headers. On large pages the first
+            # USHORT of their data is a key length, not a flag word, so any decoded flags would be bogus.
+            flags = 0
+        elif page.is_small_page:
             # Small pages have the flag in the tag
             flags = self.tag.ib_ >> 13
         elif len(self.data) >= 2:
@@ -205,8 +379,69 @@ class Tag:
 
         self.flags = TAG_FLAG(flags)
 
+    @property
+    def is_reserved(self) -> bool:
+        """Return whether this tag is reserved and does not represent a node."""
+        return self.node_num is None
+
+    @property
+    def node_num(self) -> int | None:
+        """Return the node number derived from this tag, or ``None`` for reserved tags.
+
+        Nodes occupy tags ``1`` up to ``node_count``, matching :meth:`Page.node`. Tag ``0`` (the page key
+        tag) and any trailing tags beyond ``node_count`` are reserved: they still occupy physical space in
+        the page but are never records.
+        """
+        if self.num < 1 or self.num > self.page.node_count:
+            return None
+
+        return self.num - 1
+
+    @property
+    def status(self) -> TagStatus:
+        """Return the logical visibility of this tag.
+
+        The :attr:`~dissect.esedb.c_esedb.TAG_FLAG.Deleted` bit has the same meaning for every page
+        specification, only its physical location differs (see :class:`Tag`). Reserved tags never
+        represent a record, so they are reported as ``Reserved`` regardless of their decoded bits.
+        """
+        if self.is_reserved:
+            return TagStatus.Reserved
+
+        if self.flags & TAG_FLAG.Deleted:
+            return TagStatus.Deleted
+
+        return TagStatus.Active
+
+    @property
+    def deleted(self) -> bool:
+        """Return whether this tag is logically deleted."""
+        return self.status is TagStatus.Deleted
+
+    @property
+    def active(self) -> bool:
+        """Return whether this tag is a logically active node."""
+        return self.status is TagStatus.Active
+
+    @property
+    def reserved(self) -> bool:
+        """Return whether this tag is reserved and does not represent a node."""
+        return self.status is TagStatus.Reserved
+
+    @property
+    def source(self) -> TagSource:
+        """Return the provenance of this tag."""
+        return TagSource(
+            page_num=self.page.num,
+            tag_num=self.num,
+            node_num=self.node_num,
+            offset=self.offset,
+            size=self.size,
+            status=self.status,
+        )
+
     def __repr__(self) -> str:
-        return f"<Tag offset={self.offset:#x} size={self.size:#x}>"
+        return f"<Tag offset={self.offset:#x} size={self.size:#x} status={self.status.value}>"
 
 
 class Node:

@@ -14,7 +14,7 @@ from dissect.esedb.c_esedb import PAGE_FLAG, TAGFLD_HEADER, RecordValue, c_esedb
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from dissect.esedb.page import Node
+    from dissect.esedb.page import Node, TagSource
     from dissect.esedb.table import Column, Table
 
 
@@ -50,6 +50,16 @@ class Record:
 
     def __hash__(self) -> int:
         return hash((self._table, self._node))
+
+    @property
+    def source(self) -> TagSource:
+        """Return the physical provenance of this record."""
+        return self._node.tag.source
+
+    @property
+    def deleted(self) -> bool:
+        """Return whether this record is logically deleted."""
+        return self._node.tag.deleted
 
     def __getitem__(self, attr: str) -> RecordValue:
         return self.get(attr)
